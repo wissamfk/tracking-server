@@ -1,455 +1,225 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const cheerio = require('cheerio');
-
+ 
 const app = express();
 const PORT = process.env.PORT || 3001;
-
+ 
 app.use(cors());
 app.use(express.json());
-
-// ═══════════════════════════════════════
-// HEALTH CHECK
-// ═══════════════════════════════════════
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Tracking Contenedores Proxy Server',
-    endpoints: [
-      'GET /api/track/:carrier/:number',
-      'POST /api/track-bulk'
-    ]
-  });
-});
-
-// ═══════════════════════════════════════
-// HEADERS COMUNES PARA SIMULAR NAVEGADOR
-// ═══════════════════════════════════════
-const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Connection': 'keep-alive',
-  'Cache-Control': 'no-cache',
-};
-
-// ═══════════════════════════════════════
-// SCRAPERS POR NAVIERA
-// ═══════════════════════════════════════
-
-// ─── MSC ───
-async function trackMSC(number) {
+ 
+const T49_KEY = process.env.T49_API_KEY || 'aySoHGYUv1dT4ua4hfhg4icp';
+const T49 = 'https://api.terminal49.com/v2';
+const T49H = { 'Content-Type': 'application/vnd.api+json', 'Authorization': `Token ${T49_KEY}` };
+ 
+const CARRIER_SCAC = { 'MSC':'MSCU','Maersk':'MAEU','CMA CGM':'CMDU','Hapag-Lloyd':'HLCU','COSCO':'COSU','Evergreen':'EGLV','ONE':'ONEY','Yang Ming':'YMLU','ZIM':'ZIMU' };
+const PREFIX_SCAC = { MSCU:'MSCU',MEDU:'MSCU',MSMU:'MSCU',MAEU:'MAEU',MSKU:'MAEU',MRKU:'MAEU',CMAU:'CMDU',CGMU:'CMDU',HLBU:'HLCU',HLCU:'HLCU',HLXU:'HLCU',CCLU:'COSU',CSNU:'COSU',CSQU:'COSU',CBHU:'COSU',EISU:'EGLV',EGHU:'EGLV',EMCU:'EGLV',ONEY:'ONEY',ONEU:'ONEY',YMLU:'YMLU',YMMU:'YMLU',ZIMU:'ZIMU',ZCSU:'ZIMU' };
+const SCAC_NAME = {}; Object.entries(CARRIER_SCAC).forEach(([n,s])=>{ SCAC_NAME[s]=n; });
+ 
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'Terminal49 Proxy' }));
+ 
+// ═══ TRACK: crear tracking request y devolver datos ═══
+app.post('/api/track', async (req, res) => {
+  const { number, carrier } = req.body;
+  if (!number) return res.status(400).json({ success: false, error: 'Número requerido' });
+ 
+  const num = number.trim().toUpperCase();
+  let scac = carrier && CARRIER_SCAC[carrier] ? CARRIER_SCAC[carrier] : PREFIX_SCAC[num.substring(0,4)] || '';
+  const isContainer = /^[A-Z]{4}\d{7,8}$/.test(num);
+  const type = isContainer ? 'container' : 'bill_of_lading';
+ 
+  // 1. Create tracking request
   try {
-    // MSC tiene una API interna que podemos consultar
-    const resp = await axios.get(
-      `https://www.msc.com/api/feature/tools/TrackingInfo?trackingNumber=${encodeURIComponent(number)}&trackingType=CONTAINER`,
-      {
-        headers: {
-          ...BROWSER_HEADERS,
-          'Accept': 'application/json',
-          'Referer': 'https://www.msc.com/track-a-shipment',
-        },
-        timeout: 15000,
-      }
-    );
-    
-    if (resp.data) {
-      const data = resp.data;
-      // Intentar extraer datos según la estructura de MSC
-      return {
-        carrier: 'MSC',
-        number,
-        success: true,
-        raw: data,
-        trackingUrl: `https://www.msc.com/track-a-shipment?trackingNumber=${number}`,
-      };
-    }
+    await axios.post(`${T49}/tracking_requests`, {
+      data: { type: 'tracking_request', attributes: { request_type: type, request_number: num, scac } }
+    }, { headers: T49H, timeout: 15000 });
   } catch (e) {
-    // Fallback: scraping HTML
-    try {
-      const resp = await axios.get(
-        `https://www.msc.com/track-a-shipment?trackingNumber=${encodeURIComponent(number)}`,
-        { headers: BROWSER_HEADERS, timeout: 15000 }
-      );
-      const $ = cheerio.load(resp.data);
-      return {
-        carrier: 'MSC',
-        number,
-        success: true,
-        message: 'Página cargada, datos disponibles en portal',
-        trackingUrl: `https://www.msc.com/track-a-shipment?trackingNumber=${number}`,
-        htmlAvailable: true,
-      };
-    } catch (e2) {
-      return { carrier: 'MSC', number, success: false, error: e2.message };
+    const msg = e.response?.data?.errors?.[0]?.detail || e.message;
+    // If already tracked, continue to fetch data
+    if (!msg.includes('already') && !msg.includes('exists')) {
+      return res.json({ success: false, error: msg, number: num, detectedCarrier: SCAC_NAME[scac] || '' });
     }
   }
-}
-
-// ─── MAERSK ───
-async function trackMaersk(number) {
+ 
+  // 2. Wait and fetch data
+  await sleep(3000);
+ 
+  // 3. Get all shipments and find matching one
   try {
-    // Maersk tiene una API pública de tracking
-    const resp = await axios.get(
-      `https://api.maersk.com/track/${encodeURIComponent(number)}`,
-      {
-        headers: {
-          ...BROWSER_HEADERS,
-          'Accept': 'application/json',
-          'Consumer-Key': 'your-consumer-key', // Maersk requiere API key
-        },
-        timeout: 15000,
-      }
-    );
-    return { carrier: 'Maersk', number, success: true, raw: resp.data };
-  } catch (e) {
-    // Fallback: intentar scraping
-    try {
-      const resp = await axios.get(
-        `https://www.maersk.com/tracking/${encodeURIComponent(number)}`,
-        { headers: BROWSER_HEADERS, timeout: 15000 }
-      );
-      
-      const $ = cheerio.load(resp.data);
-      
-      // Buscar datos en el HTML o scripts embebidos
-      const scripts = $('script').map((i, el) => $(el).html()).get();
-      let trackingData = null;
-      
-      for (const script of scripts) {
-        if (script && (script.includes('trackingData') || script.includes('shipmentInfo'))) {
-          try {
-            const match = script.match(/window\.__INITIAL_STATE__\s*=\s*({.*?});/s);
-            if (match) trackingData = JSON.parse(match[1]);
-          } catch {}
-        }
-      }
-      
-      return {
-        carrier: 'Maersk',
-        number,
-        success: true,
-        raw: trackingData,
-        trackingUrl: `https://www.maersk.com/tracking/${number}`,
-      };
-    } catch (e2) {
-      return { carrier: 'Maersk', number, success: false, error: e2.message };
-    }
-  }
-}
-
-// ─── CMA CGM ───
-async function trackCMACGM(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.cma-cgm.com/api/tracing/tracking?reference=${encodeURIComponent(number)}`,
-      {
-        headers: {
-          ...BROWSER_HEADERS,
-          'Accept': 'application/json',
-          'Referer': 'https://www.cma-cgm.com/ebusiness/tracking',
-        },
-        timeout: 15000,
-      }
-    );
-    return { carrier: 'CMA CGM', number, success: true, raw: resp.data };
-  } catch (e) {
-    return {
-      carrier: 'CMA CGM',
-      number,
-      success: false,
-      error: e.message,
-      trackingUrl: `https://www.cma-cgm.com/ebusiness/tracking/search?Reference=${number}`,
-    };
-  }
-}
-
-// ─── HAPAG-LLOYD ───
-async function trackHapagLloyd(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.hapag-lloyd.com/en/online-business/track/track-by-container-solution.html?container=${encodeURIComponent(number)}`,
-      { headers: BROWSER_HEADERS, timeout: 15000 }
-    );
-    const $ = cheerio.load(resp.data);
-    return {
-      carrier: 'Hapag-Lloyd',
-      number,
-      success: true,
-      trackingUrl: `https://www.hapag-lloyd.com/en/online-business/track/track-by-container-solution.html?container=${number}`,
-    };
-  } catch (e) {
-    return { carrier: 'Hapag-Lloyd', number, success: false, error: e.message };
-  }
-}
-
-// ─── COSCO ───
-async function trackCOSCO(number) {
-  try {
-    const resp = await axios.post(
-      'https://elines.coscoshipping.com/ebtracking/public/containers/search',
-      { number: number },
-      {
-        headers: {
-          ...BROWSER_HEADERS,
-          'Content-Type': 'application/json',
-          'Referer': 'https://elines.coscoshipping.com/ebusiness/cargotracking',
-        },
-        timeout: 15000,
-      }
-    );
-    return { carrier: 'COSCO', number, success: true, raw: resp.data };
-  } catch (e) {
-    return {
-      carrier: 'COSCO',
-      number,
-      success: false,
-      error: e.message,
-      trackingUrl: `https://elines.coscoshipping.com/ebusiness/cargotracking?number=${number}`,
-    };
-  }
-}
-
-// ─── ZIM ───
-async function trackZIM(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.zim.com/api/tracking?consnumber=${encodeURIComponent(number)}`,
-      {
-        headers: {
-          ...BROWSER_HEADERS,
-          'Accept': 'application/json',
-          'Referer': 'https://www.zim.com/tools/track-a-shipment',
-        },
-        timeout: 15000,
-      }
-    );
-    return { carrier: 'ZIM', number, success: true, raw: resp.data };
-  } catch (e) {
-    return {
-      carrier: 'ZIM',
-      number,
-      success: false,
-      error: e.message,
-      trackingUrl: `https://www.zim.com/tools/track-a-shipment?consnumber=${number}`,
-    };
-  }
-}
-
-// ─── ONE ───
-async function trackONE(number) {
-  try {
-    const resp = await axios.get(
-      `https://ecomm.one-line.com/one-ecom/manage-shipment/cargo-tracking?regos-tracking-number=${encodeURIComponent(number)}`,
-      { headers: BROWSER_HEADERS, timeout: 15000 }
-    );
-    return {
-      carrier: 'ONE',
-      number,
-      success: true,
-      trackingUrl: `https://ecomm.one-line.com/one-ecom/manage-shipment/cargo-tracking?regos-tracking-number=${number}`,
-    };
-  } catch (e) {
-    return { carrier: 'ONE', number, success: false, error: e.message };
-  }
-}
-
-// ─── EVERGREEN ───
-async function trackEvergreen(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.shipmentlink.com/servlet/TDB1_CargoTracking.do?BolsLst=${encodeURIComponent(number)}`,
-      { headers: BROWSER_HEADERS, timeout: 15000 }
-    );
-    const $ = cheerio.load(resp.data);
-    
-    // Extraer tabla de tracking
-    const events = [];
-    $('table.tbl_Hispowerful tr').each((i, row) => {
-      if (i === 0) return; // skip header
-      const cols = $(row).find('td');
-      if (cols.length >= 4) {
-        events.push({
-          date: $(cols[0]).text().trim(),
-          location: $(cols[1]).text().trim(),
-          description: $(cols[2]).text().trim(),
-          vessel: $(cols[3]).text().trim(),
-        });
-      }
+    const resp = await axios.get(`${T49}/shipments?include=containers`, { headers: T49H, timeout: 20000 });
+    const shipments = resp.data?.data || [];
+    const included = resp.data?.included || [];
+ 
+    // Find matching shipment
+    let match = shipments.find(s => {
+      const a = s.attributes || {};
+      if (a.bill_of_lading_number === num) return true;
+      if (a.booking_number === num) return true;
+      // Check containers
+      const cIds = (s.relationships?.containers?.data || []).map(c => c.id);
+      return included.some(i => i.type === 'container' && cIds.includes(i.id) && i.attributes?.number === num);
     });
-    
-    return {
-      carrier: 'Evergreen',
-      number,
-      success: true,
-      events: events.length ? events : null,
-      trackingUrl: `https://www.shipmentlink.com/servlet/TDB1_CargoTracking.do?BolsLst=${number}`,
-    };
-  } catch (e) {
-    return { carrier: 'Evergreen', number, success: false, error: e.message };
-  }
-}
-
-// ─── YANG MING ───
-async function trackYangMing(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.yangming.com/e-service/track_trace/track_trace_cargo_tracking.aspx?search=${encodeURIComponent(number)}`,
-      { headers: BROWSER_HEADERS, timeout: 15000 }
-    );
-    return {
-      carrier: 'Yang Ming',
-      number,
-      success: true,
-      trackingUrl: `https://www.yangming.com/e-service/track_trace/track_trace_cargo_tracking.aspx?search=${number}`,
-    };
-  } catch (e) {
-    return { carrier: 'Yang Ming', number, success: false, error: e.message };
-  }
-}
-
-// ─── TRACK-TRACE.COM (servicio universal) ───
-async function trackGeneric(number) {
-  try {
-    const resp = await axios.get(
-      `https://www.track-trace.com/container?number=${encodeURIComponent(number)}`,
-      { headers: BROWSER_HEADERS, timeout: 15000 }
-    );
-    const $ = cheerio.load(resp.data);
-    
-    // Track-trace.com muestra info del contenedor
-    const info = {};
-    
-    // Intentar detectar la naviera
-    const carrierText = $('body').text();
-    const carriers = ['MSC', 'Maersk', 'CMA CGM', 'Hapag-Lloyd', 'COSCO', 'Evergreen', 'ONE', 'ZIM', 'Yang Ming'];
-    for (const c of carriers) {
-      if (carrierText.includes(c)) {
-        info.detectedCarrier = c;
-        break;
+ 
+    if (!match && shipments.length > 0) match = shipments[0]; // fallback to latest
+ 
+    if (match) {
+      const a = match.attributes || {};
+      const cIds = (match.relationships?.containers?.data || []).map(c => c.id);
+      const containers = included.filter(i => i.type === 'container' && cIds.includes(i.id)).map(c => ({
+        number: c.attributes?.number || '',
+        type: c.attributes?.equipment_type || '',
+        status: c.attributes?.status || '',
+        weightKg: c.attributes?.weight_kg || '',
+        seal: c.attributes?.seal_number || '',
+        podArrived: c.attributes?.pod_arrived_at || '',
+        podDischarged: c.attributes?.pod_discharged_at || '',
+        polLoaded: c.attributes?.pol_loaded_at || '',
+      }));
+ 
+      // Get transport events for the first container
+      let events = [];
+      if (cIds.length > 0) {
+        try {
+          const evResp = await axios.get(`${T49}/containers/${cIds[0]}/transport_events`, { headers: T49H, timeout: 15000 });
+          events = (evResp.data?.data || []).map(e => ({
+            date: e.attributes?.actual_time || e.attributes?.estimated_time || '',
+            description: e.attributes?.description || e.attributes?.event || '',
+            location: e.attributes?.location || '',
+            vessel: e.attributes?.vessel_name || '',
+            voyage: e.attributes?.voyage_number || '',
+          })).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+        } catch (evErr) { /* events unavailable */ }
       }
+ 
+      return res.json({
+        success: true,
+        number: num,
+        detectedCarrier: a.shipping_line_name || SCAC_NAME[a.shipping_line_scac] || SCAC_NAME[scac] || '',
+        shippingLine: a.shipping_line_name || SCAC_NAME[a.shipping_line_scac] || '',
+        billOfLading: a.bill_of_lading_number || '',
+        status: a.status || '',
+        portOfLading: a.port_of_lading_name || '',
+        portOfLadingCode: a.port_of_lading_locode || '',
+        portOfDischarge: a.port_of_discharge_name || '',
+        portOfDischargeCode: a.port_of_discharge_locode || '',
+        finalDestination: a.final_destination_name || '',
+        vesselName: a.vessel_name || '',
+        voyageNumber: a.voyage_number || '',
+        eta: a.pod_eta || '',
+        etd: a.pol_etd || '',
+        actualArrival: a.pod_arrived_at || '',
+        actualDeparture: a.pol_loaded_at || '',
+        containers,
+        events,
+      });
     }
-    
-    return {
-      carrier: 'Track-Trace',
-      number,
+ 
+    return res.json({
       success: true,
-      info,
-      trackingUrl: `https://www.track-trace.com/container?number=${number}`,
-    };
+      number: num,
+      detectedCarrier: SCAC_NAME[scac] || '',
+      message: 'Tracking creado. Los datos tardan 1-3 minutos. Intenta de nuevo.',
+      status: 'processing',
+    });
   } catch (e) {
-    return { carrier: 'Track-Trace', number, success: false, error: e.message };
+    return res.json({
+      success: true,
+      number: num,
+      detectedCarrier: SCAC_NAME[scac] || '',
+      message: 'Tracking request creado. Intenta de nuevo en 1-2 minutos para obtener datos.',
+      status: 'processing',
+    });
   }
-}
-
-// ═══════════════════════════════════════
-// MAP DE SCRAPERS
-// ═══════════════════════════════════════
-const SCRAPERS = {
-  'MSC': trackMSC,
-  'Maersk': trackMaersk,
-  'CMA CGM': trackCMACGM,
-  'Hapag-Lloyd': trackHapagLloyd,
-  'COSCO': trackCOSCO,
-  'ZIM': trackZIM,
-  'ONE': trackONE,
-  'Evergreen': trackEvergreen,
-  'Yang Ming': trackYangMing,
-};
-
-// ═══════════════════════════════════════
-// ENDPOINT: Rastrear un contenedor
-// ═══════════════════════════════════════
-app.get('/api/track/:carrier/:number', async (req, res) => {
-  const { carrier, number } = req.params;
-  
+});
+ 
+// ═══ GET SHIPMENTS ═══
+app.get('/api/shipments', async (req, res) => {
   try {
-    const scraper = SCRAPERS[carrier];
-    if (scraper) {
-      const result = await scraper(number);
-      return res.json(result);
-    }
-    
-    // Si no hay scraper específico, usar Track-Trace
-    const result = await trackGeneric(number);
-    return res.json(result);
-  } catch (e) {
-    return res.json({ carrier, number, success: false, error: e.message });
-  }
+    const resp = await axios.get(`${T49}/shipments?include=containers`, { headers: T49H, timeout: 20000 });
+    const shipments = (resp.data?.data || []).map(s => {
+      const a = s.attributes || {};
+      const included = resp.data?.included || [];
+      const cIds = (s.relationships?.containers?.data || []).map(c => c.id);
+      const containers = included.filter(i => i.type === 'container' && cIds.includes(i.id)).map(c => ({
+        number: c.attributes?.number || '',
+        type: c.attributes?.equipment_type || '',
+        status: c.attributes?.status || '',
+      }));
+ 
+      return {
+        id: s.id,
+        billOfLading: a.bill_of_lading_number || '',
+        shippingLine: a.shipping_line_name || SCAC_NAME[a.shipping_line_scac] || '',
+        status: a.status || '',
+        portOfLading: a.port_of_lading_name || '',
+        portOfDischarge: a.port_of_discharge_name || '',
+        vesselName: a.vessel_name || '',
+        eta: a.pod_eta || '',
+        etd: a.pol_etd || '',
+        containers,
+      };
+    });
+    res.json({ success: true, shipments });
+  } catch (e) { res.json({ success: false, error: e.message }); }
 });
-
-// ═══════════════════════════════════════
-// ENDPOINT: Auto-detectar naviera
-// ═══════════════════════════════════════
-app.get('/api/detect/:number', async (req, res) => {
-  const { number } = req.params;
-  
-  // Detección por prefijo del contenedor
-  const prefix = number.substring(0, 4).toUpperCase();
-  const prefixMap = {
-    'MSCU': 'MSC', 'MEDU': 'MSC', 'MSMU': 'MSC',
-    'MAEU': 'Maersk', 'MSKU': 'Maersk', 'MRKU': 'Maersk', 'MRSU': 'Maersk',
-    'CMAU': 'CMA CGM', 'CGMU': 'CMA CGM',
-    'HLBU': 'Hapag-Lloyd', 'HLCU': 'Hapag-Lloyd', 'HLXU': 'Hapag-Lloyd',
-    'CCLU': 'COSCO', 'CSNU': 'COSCO', 'CSQU': 'COSCO', 'CBHU': 'COSCO',
-    'EISU': 'Evergreen', 'EGHU': 'Evergreen', 'EMCU': 'Evergreen', 'EITU': 'Evergreen',
-    'ONEY': 'ONE', 'ONEU': 'ONE',
-    'YMLU': 'Yang Ming', 'YMMU': 'Yang Ming',
-    'ZIMU': 'ZIM', 'ZCSU': 'ZIM',
-  };
-  
-  const detected = prefixMap[prefix] || null;
-  
-  if (detected && SCRAPERS[detected]) {
-    try {
-      const result = await SCRAPERS[detected](number);
-      return res.json({ ...result, detectedCarrier: detected });
-    } catch (e) {
-      return res.json({ number, detectedCarrier: detected, success: false, error: e.message });
-    }
-  }
-  
-  // Si no detectamos, intentar Track-Trace
-  const result = await trackGeneric(number);
-  return res.json({ ...result, detectedCarrier: detected });
-});
-
-// ═══════════════════════════════════════
-// ENDPOINT: Rastrear múltiples
-// ═══════════════════════════════════════
+ 
+// ═══ TRACK BULK ═══
 app.post('/api/track-bulk', async (req, res) => {
   const { containers } = req.body;
-  // containers = [{ number: 'MSCU123', carrier: 'MSC' }, ...]
-  
-  if (!containers || !Array.isArray(containers)) {
-    return res.status(400).json({ error: 'Se requiere un array de containers' });
+  if (!containers?.length) return res.status(400).json({ error: 'Array vacío' });
+ 
+  const results = [];
+  for (const c of containers) {
+    const num = (c.number || '').trim().toUpperCase();
+    const scac = c.carrier && CARRIER_SCAC[c.carrier] ? CARRIER_SCAC[c.carrier] : PREFIX_SCAC[num.substring(0,4)] || '';
+    const isContainer = /^[A-Z]{4}\d{7,8}$/.test(num);
+ 
+    try {
+      await axios.post(`${T49}/tracking_requests`, {
+        data: { type: 'tracking_request', attributes: { request_type: isContainer ? 'container' : 'bill_of_lading', request_number: num, scac } }
+      }, { headers: T49H, timeout: 10000 });
+      results.push({ number: num, success: true });
+    } catch (e) {
+      const msg = e.response?.data?.errors?.[0]?.detail || e.message;
+      results.push({ number: num, success: msg.includes('already') || msg.includes('exists'), error: msg });
+    }
+    await sleep(400);
   }
-  
-  const results = await Promise.allSettled(
-    containers.map(async (c) => {
-      const scraper = SCRAPERS[c.carrier];
-      if (scraper) return scraper(c.number);
-      return trackGeneric(c.number);
-    })
-  );
-  
-  const data = results.map((r, i) => ({
-    ...containers[i],
-    result: r.status === 'fulfilled' ? r.value : { success: false, error: r.reason?.message },
-  }));
-  
-  res.json({ results: data });
+ 
+  // Wait then fetch all data
+  await sleep(4000);
+ 
+  try {
+    const resp = await axios.get(`${T49}/shipments?include=containers`, { headers: T49H, timeout: 20000 });
+    const shipments = (resp.data?.data || []).map(s => {
+      const a = s.attributes || {};
+      const included = resp.data?.included || [];
+      const cIds = (s.relationships?.containers?.data || []).map(c => c.id);
+      const cons = included.filter(i => i.type === 'container' && cIds.includes(i.id)).map(c => ({
+        number: c.attributes?.number || '',
+        status: c.attributes?.status || '',
+        type: c.attributes?.equipment_type || '',
+      }));
+      return {
+        billOfLading: a.bill_of_lading_number || '',
+        shippingLine: a.shipping_line_name || SCAC_NAME[a.shipping_line_scac] || '',
+        status: a.status || '',
+        portOfLading: a.port_of_lading_name || '',
+        portOfDischarge: a.port_of_discharge_name || '',
+        vesselName: a.vessel_name || '',
+        eta: a.pod_eta || '',
+        containers: cons,
+      };
+    });
+    res.json({ success: true, message: `${results.filter(r=>r.success).length}/${results.length} procesados`, results, shipments });
+  } catch (e) {
+    res.json({ success: true, message: 'Tracking requests creados, datos disponibles en 1-2 min', results });
+  }
 });
-
-// ═══════════════════════════════════════
-// START
-// ═══════════════════════════════════════
+ 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+ 
 app.listen(PORT, () => {
-  console.log(`\n🚢 Tracking Proxy Server corriendo en http://localhost:${PORT}`);
-  console.log(`\nEndpoints:`);
-  console.log(`  GET  /api/track/:carrier/:number  - Rastrear un contenedor`);
-  console.log(`  GET  /api/detect/:number           - Auto-detectar naviera`);
-  console.log(`  POST /api/track-bulk               - Rastrear múltiples\n`);
+  console.log(`🚢 Terminal49 Proxy en puerto ${PORT}`);
 });
+ 
