@@ -295,9 +295,13 @@ function parseShipsGoData(data, number, shippingLine) {
   // BL containers
   const blContainers = sd.BLContainers || [];
   const containers = Array.isArray(blContainers) ? blContainers.map(c => ({
-    number: c.ContainerNumber || c,
-    type: '', status: '',
-  })) : [];
+    number: c.ContainerCode || c.ContainerNumber || (typeof c === 'string' ? c : ''),
+    type: c.ContainerType || c.ContainerTEU ? (c.ContainerType || '') + (c.ContainerTEU ? " " + c.ContainerTEU + "'" : '') : '',
+    status: '',
+    gateIn: c.BLGateInDate || '',
+    gateOut: c.BLGateOutDate || '',
+    liveMapUrl: c.LiveMapUrl || '',
+  })).filter(c => c.number) : [];
  
   const hasData = !!(origin || destination || eta || vessel || events.length > 0 || status);
  
